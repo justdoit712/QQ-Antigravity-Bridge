@@ -10,7 +10,7 @@ if [[ $(uname -s) != Linux || $(uname -m) != x86_64 ]]; then
     exit 1
 fi
 
-for tool in curl tar gzip flock mktemp; do
+for tool in curl tar gzip flock mktemp sha256sum; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "缺少命令 $tool，请先安装后重试。" >&2
         exit 1
@@ -27,12 +27,26 @@ fi
 
 uv_path="$project_dir/.runtime/uv/uv"
 if [[ ! -x "$uv_path" ]]; then
-    uv_installer=$(mktemp "$project_dir/.runtime/uv-installer.XXXXXX")
-    trap 'rm -f -- "$uv_installer"' EXIT
-    curl --fail --show-error --location --retry 3 \
-        https://astral.sh/uv/install.sh --output "$uv_installer"
-    UV_UNMANAGED_INSTALL="$project_dir/.runtime/uv" sh "$uv_installer"
+    uv_version=0.13.7
+    uv_package=uv-x86_64-unknown-linux-gnu
+    uv_sha256=c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83
+    uv_work=$(mktemp -d "$project_dir/.runtime/uv-install.XXXXXX")
+    trap 'rm -rf -- "$uv_work"' EXIT
+    uv_archive="$uv_work/$uv_package.tar.gz"
+    echo "正在下载 uv $uv_version，将显示进度；单次下载最多等待 180 秒。"
+    curl --fail --show-error --location --progress-bar \
+        --connect-timeout 10 --max-time 180 --retry 2 \
+        "https://releases.astral.sh/github/uv/releases/download/$uv_version/$uv_package.tar.gz" \
+        --output "$uv_archive"
+    printf '%s  %s\n' "$uv_sha256" "$uv_archive" | sha256sum --check -
+    tar -xzf "$uv_archive" -C "$uv_work" -- "$uv_package/uv" "$uv_package/uvx"
+    chmod 755 -- "$uv_work/$uv_package/uv" "$uv_work/$uv_package/uvx"
+    "$uv_work/$uv_package/uv" --version >/dev/null
+    mkdir -p -- "$project_dir/.runtime/uv"
+    mv -- "$uv_work/$uv_package/uvx" "$project_dir/.runtime/uv/uvx"
+    mv -- "$uv_work/$uv_package/uv" "$uv_path"
 fi
+"$uv_path" --version
 
 export UV_PYTHON_INSTALL_DIR="$project_dir/.runtime/python"
 export UV_CACHE_DIR="$project_dir/.runtime/uv-cache"

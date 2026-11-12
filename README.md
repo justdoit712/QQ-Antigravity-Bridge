@@ -59,13 +59,13 @@
 
 `centos7` 分支增加 Linux 无界面运行支持。部署目录约定为 `/opt/qq-antigravity-bridge`，服务账号为 `qqbridge`，账号主目录为 `/home/qqbridge`。下面的 systemd 文件使用这些路径。
 
-安装脚本在项目 `.runtime` 中安装 uv 和独立 Python 3.11，并创建 `.venv`。uv 的 x86_64 Linux 构建和对应的 Python 构建支持 glibc 2.17，项目依赖安装限定为兼容 `manylinux_2_17` 的预编译 wheel。Antigravity 使用官方 `linux_amd64_musl` 清单中的静态构建，逐次核对 SHA512，并在安装完成前执行 `agy --version`。该分支需要在目标 CentOS 7 机器上完成 CLI 登录、模型生成和 QQ 收发验收。[uv 平台支持](https://docs.astral.sh/uv/reference/policies/platforms/)、[Python 构建运行要求](https://gregoryszorc.com/docs/python-build-standalone/main/running.html)
+安装脚本在项目 `.runtime` 中安装 uv 和独立 Python 3.11，并创建 `.venv`。uv 固定为 0.13.7，从 Astral 官方镜像下载，显示下载进度并校验 SHA256，单次下载限时 180 秒，失败后最多重试两次。uv 的 x86_64 Linux 构建和对应的 Python 构建支持 glibc 2.17，项目依赖安装限定为兼容 `manylinux_2_17` 的预编译 wheel。Antigravity 使用官方 `linux_amd64_musl` 清单中的静态构建，逐次核对 SHA512，并在安装完成前执行 `agy --version`。该分支需要在目标 CentOS 7 机器上完成 CLI 登录、模型生成和 QQ 收发验收。[uv 平台支持](https://docs.astral.sh/uv/reference/policies/platforms/)、[Python 构建运行要求](https://gregoryszorc.com/docs/python-build-standalone/main/running.html)
 
 ### 获取源码并安装运行环境
 
-服务器需要 `git`、`curl`、`tar`、`gzip`、`flock` 和有效的 CA 根证书，以及访问 GitHub、Astral、Google 官方下载和模型服务、QQ 服务的网络连接。
+服务器需要 `git`、`curl`、`tar`、`gzip`、`flock`、`sha256sum` 和有效的 CA 根证书，以及访问 GitHub、Astral、Google 官方下载和模型服务、QQ 服务的网络连接。
 
-将代码推送到 GitHub 私有仓库后，使用 root 创建服务账号和部署目录。
+使用 root 创建服务账号和部署目录。
 
 ```bash
 useradd --system --user-group --create-home --home-dir /home/qqbridge --shell /bin/bash qqbridge
@@ -73,10 +73,10 @@ install -d -o qqbridge -g qqbridge -m 755 /opt/qq-antigravity-bridge
 su - qqbridge
 ```
 
-在 `qqbridge` 账号下配置仓库的只读部署密钥，然后拉取代码并安装运行环境。把仓库地址替换为实际 SSH 地址。后续更新同样在 `qqbridge` 账号下执行。[GitHub 部署密钥](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys)
+在 `qqbridge` 账号下通过 HTTPS 拉取公开仓库并安装运行环境。后续更新同样在 `qqbridge` 账号下执行。
 
 ```bash
-git clone --branch centos7 '你的私有仓库SSH地址' /opt/qq-antigravity-bridge
+git clone --branch centos7 https://github.com/justdoit712/QQ-Antigravity-Bridge.git /opt/qq-antigravity-bridge
 cd /opt/qq-antigravity-bridge
 bash deploy/centos7-install.sh
 ```
