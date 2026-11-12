@@ -1,11 +1,13 @@
 import asyncio
 import hashlib
 import json
+import os
+import signal
 import sys
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from agy_backend import AgyBackend, AgyError, CHAT_SETTINGS, parse_response
+from agy_backend import AgyBackend, AgyError, CHAT_SETTINGS, kill_process_tree, parse_response
 from config_store import Config
 
 
@@ -35,6 +37,28 @@ class ResultTests(unittest.TestCase):
 
 
 class ProcessTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    async def test_cleanup_kills_descendants_after_parent_exit(self):
+        # The direct CLI can exit while a descendant still holds its output pipe.
+        parent = "import subprocess,sys; subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'])"
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", parent, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, start_new_session=True,
+        )
+        try:
+            async with asyncio.timeout(3):
+                while process.returncode is None:
+                    await asyncio.sleep(0.01)
+            with patch("agy_backend.os.killpg", wraps=os.killpg) as kill_group:
+                await kill_process_tree(process)
+            kill_group.assert_called_once_with(process.pid, signal.SIGKILL)
+            await asyncio.wait_for(process.communicate(), 3)
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
     async def test_long_unicode_prompt_over_real_stdin_and_permissions(self):
         actual_spawn = asyncio.create_subprocess_exec
         text = '中文"引号"\n下一行😀' * 500

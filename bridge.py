@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import secrets
+import signal
 import sys
 import threading
 import time
@@ -17,7 +18,7 @@ from collections import OrderedDict
 from dataclasses import replace
 
 from agy_backend import AgyBackend, AgyError
-from config_store import CONFIG_PATH, ROOT, Config, load_config, save_config
+from config_store import CONFIG_PATH, ROOT, Config, ConfigError, load_config, save_config
 
 VERSION = "0.2.0"
 
@@ -31,18 +32,21 @@ class RunLock:
     def __enter__(self):
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         self.file = (CONFIG_PATH.parent / "bridge.lock").open("a+b")
-        if os.name == "nt":
-            import msvcrt
-            self.file.seek(0, 2)
-            if not self.file.tell():
-                self.file.write(b"0")
-                self.file.flush()
-            self.file.seek(0)
-            try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.file.seek(0, 2)
+                if not self.file.tell():
+                    self.file.write(b"0")
+                    self.file.flush()
+                self.file.seek(0)
                 msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError as exc:
-                self.file.close()
-                raise RuntimeError("此程序已经启动，请先停止另一个窗口。") from exc
+            else:
+                import fcntl
+                fcntl.flock(self.file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self.file.close()
+            raise RuntimeError("此程序已经启动，请先停止另一个实例。") from exc
         return self
 
     def __exit__(self, *_):
@@ -256,14 +260,22 @@ def watch_stdin(stop: asyncio.Event, loop: asyncio.AbstractEventLoop) -> None:
     threading.Thread(target=read, daemon=True, name="bridge-stop").start()
 
 
-async def run_bridge(config: Config) -> None:
+def watch_shutdown(stop: asyncio.Event, *, daemon: bool = False) -> None:
+    loop = asyncio.get_running_loop()
+    if not daemon:
+        watch_stdin(stop, loop)
+    if os.name != "nt":
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(signum, stop.set)
+
+
+async def run_bridge(config: Config, *, daemon: bool = False) -> None:
     from qq_transport import QQTransport
     config.validate_qq()
     backend = AgyBackend(config)
     bridge = ChatBridge(config, backend)
     stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    watch_stdin(stop, loop)
+    watch_shutdown(stop, daemon=daemon)
     transport = QQTransport(config.app_id, config.app_secret, bridge.handle,
                             lambda text: emit("status", text))
     bridge.transport = transport
@@ -288,9 +300,9 @@ async def run_bridge(config: Config) -> None:
             await asyncio.gather(connection, return_exceptions=True)
 
 
-async def check_agy(config: Config) -> None:
+async def check_agy(config: Config, *, daemon: bool = False) -> None:
     stop = asyncio.Event()
-    watch_stdin(stop, asyncio.get_running_loop())
+    watch_shutdown(stop, daemon=daemon)
     backend = AgyBackend(config)
     emit("status", "正在测试 Antigravity 登录与文字回复…")
     reply = asyncio.create_task(backend.reply([], "只回复四个字：连接成功。"))
@@ -313,6 +325,7 @@ def main() -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="QQ 官方机器人与 Antigravity 私聊桥接")
     parser.add_argument("command", choices=["run", "check-agy", "version"])
+    parser.add_argument("--daemon", action="store_true", help="由服务管理器运行，通过系统信号停止")
     args = parser.parse_args()
     if args.command == "version":
         print(VERSION)
@@ -322,11 +335,12 @@ def main() -> int:
     try:
         config = load_config()
         with RunLock():
-            asyncio.run(run_bridge(config) if args.command == "run" else check_agy(config))
+            asyncio.run(run_bridge(config, daemon=args.daemon) if args.command == "run"
+                        else check_agy(config, daemon=args.daemon))
         return 0
     except KeyboardInterrupt:
         return 0
-    except (ValueError, AgyError) as exc:
+    except (ValueError, AgyError, ConfigError) as exc:
         emit("error", str(exc))
         return 1
     except Exception as exc:

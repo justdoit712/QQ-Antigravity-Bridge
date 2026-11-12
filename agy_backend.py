@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -74,9 +76,9 @@ def parse_response(stdout: bytes, stderr: bytes, returncode: int) -> str:
 
 
 async def kill_process_tree(proc: asyncio.subprocess.Process) -> None:
-    if proc.returncode is not None:
-        return
     if os.name == "nt":
+        if proc.returncode is not None:
+            return
         try:
             cleanup = await asyncio.create_subprocess_exec(
                 "taskkill", "/PID", str(proc.pid), "/T", "/F",
@@ -86,6 +88,9 @@ async def kill_process_tree(proc: asyncio.subprocess.Process) -> None:
             await asyncio.wait_for(cleanup.wait(), 5)
         except (OSError, TimeoutError):
             pass
+    else:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
     if proc.returncode is None:
         try:
             proc.kill()
@@ -126,7 +131,8 @@ class AgyBackend:
         env = {key: value for key, value in os.environ.items()
                if not key.upper().startswith(("QQBOT_", "ONEBOT_"))}
         env["PYTHONUTF8"] = "1"
-        options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+        options = ({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt"
+                   else {"start_new_session": True})
         process = await asyncio.create_subprocess_exec(
             *args, cwd=str(work), env=env, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **options,

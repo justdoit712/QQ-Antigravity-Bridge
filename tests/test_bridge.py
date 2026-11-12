@@ -1,11 +1,13 @@
 import asyncio
 import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-from bridge import ChatBridge, RunLock
+from bridge import ChatBridge, RunLock, check_agy, watch_shutdown
 from config_store import Config
 from qq_transport import QQMessage
 
@@ -120,3 +122,77 @@ class RunLockTests(unittest.TestCase):
                             pass
                 with RunLock():
                     pass
+
+
+class ShutdownTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signals")
+    async def test_daemon_entrypoint_survives_eof_and_stops_on_sigterm(self):
+        script = '''
+import sys
+from unittest.mock import patch
+from bridge import main
+from config_store import Config
+
+class FakeTransport:
+    def __init__(self, *args):
+        pass
+
+    async def run(self, stop):
+        print("transport-ready", flush=True)
+        await stop.wait()
+
+sys.argv = ["bridge.py", "run", "--daemon"]
+with patch("bridge.load_config", return_value=Config("123", "test-secret", owner_id="owner")), \\
+        patch("bridge.RunLock"), patch("qq_transport.QQTransport", FakeTransport):
+    raise SystemExit(main())
+'''
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", script, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            async with asyncio.timeout(3):
+                line = b""
+                while b"transport-ready" not in line:
+                    line = await process.stdout.readline()
+                    self.assertTrue(line, "Daemon exited before transport startup")
+            await asyncio.sleep(0.05)
+            self.assertIsNone(process.returncode)
+            process.terminate()
+            stdout, stderr = await asyncio.wait_for(process.communicate(), 3)
+            self.assertEqual(process.returncode, 0, stderr.decode())
+            self.assertIn(b'"stopped"', stdout)
+        finally:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+
+    async def test_default_mode_keeps_desktop_stdin_shutdown(self):
+        stop = asyncio.Event()
+        loop = Mock()
+        with patch("bridge.watch_stdin") as stdin, \
+                patch("bridge.asyncio.get_running_loop", return_value=loop):
+            watch_shutdown(stop)
+        stdin.assert_called_once_with(stop, loop)
+
+    async def test_daemon_uses_signals_and_ignores_stdin(self):
+        stop = asyncio.Event()
+        loop = Mock()
+        with patch("bridge.os.name", "posix"), \
+                patch("bridge.watch_stdin") as stdin, \
+                patch("bridge.asyncio.get_running_loop", return_value=loop):
+            watch_shutdown(stop, daemon=True)
+        stdin.assert_not_called()
+        self.assertEqual(loop.add_signal_handler.call_count, 2)
+        loop.add_signal_handler.call_args.args[1]()
+        self.assertTrue(stop.is_set())
+
+    async def test_headless_check_completes_without_stdin(self):
+        backend = Mock(reply=AsyncMock(return_value="连接成功"), close=AsyncMock())
+        with patch("bridge.AgyBackend", return_value=backend), \
+                patch("bridge.watch_stdin") as stdin, patch("bridge.emit") as emit:
+            await check_agy(Config(), daemon=True)
+        stdin.assert_not_called()
+        backend.reply.assert_awaited_once()
+        backend.close.assert_awaited_once()
+        self.assertTrue(any(call.args[0] == "checked" for call in emit.call_args_list))

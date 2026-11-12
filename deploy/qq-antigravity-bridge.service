@@ -1,0 +1,26 @@
+[Unit]
+Description=QQ Antigravity Bridge
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=qqbridge
+Group=qqbridge
+WorkingDirectory=/opt/qq-antigravity-bridge
+Environment="HOME=/home/qqbridge"
+Environment="PATH=/opt/qq-antigravity-bridge/.runtime/agy/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUTF8=1"
+Environment="AGY_CLI_DISABLE_AUTO_UPDATE=true"
+EnvironmentFile=/opt/qq-antigravity-bridge/.local/server.env
+ExecStart=/opt/qq-antigravity-bridge/.venv/bin/python /opt/qq-antigravity-bridge/bridge.py run --daemon
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+KillMode=control-group
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

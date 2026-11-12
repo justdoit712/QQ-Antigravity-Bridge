@@ -4,7 +4,7 @@
 
 ## 首次使用
 
-1. 双击 `start.cmd`。首次运行会安装独立 Python 环境与腾讯 SDK，需要 Python 3.10+ 和网络。
+1. 双击 `start.cmd`。首次运行会安装独立 Python 环境与腾讯 SDK，需要 Python 3.11+ 和网络。
 2. 在窗口填写机器人 **AppID、AppSecret**。AppSecret 用 Windows DPAPI 加密保存在 `.local/config.json`，绑定当前 Windows 用户；不要把整个 `.local` 目录分享给他人。
 3. 点 **测试 Antigravity**。若提示登录不可用，双击 `login-antigravity.cmd`，在官方 CLI 中完成登录，再测试。模型留空使用 CLI 默认模型；也可填写 `agy models` 中列出的模型 ID。使用你的 Antigravity 登录与额度，本程序不提供模型额度。
 4. 点 **启动桥接**。在手机 QQ 打开机器人的资料卡（管理页名称旁的二维码可用于打开），按页面的添加/发消息入口进入私聊。若后台限制服务范围，请将你自己的 QQ 加入「内部体验号码」。
@@ -54,3 +54,80 @@
 - [Antigravity 权限](https://antigravity.google/docs/permissions/)
 
 目录内包含配置窗口、官方 QQ 连接、CLI 适配、配对及测试；与其他 QQ 项目的配置、数据库、依赖独立。
+
+## CentOS 7 云服务器部署
+
+`centos7` 分支增加 Linux 无界面运行支持。部署目录约定为 `/opt/qq-antigravity-bridge`，服务账号为 `qqbridge`，账号主目录为 `/home/qqbridge`。下面的 systemd 文件使用这些路径。
+
+安装脚本在项目 `.runtime` 中安装 uv 和独立 Python 3.11，并创建 `.venv`。uv 的 x86_64 Linux 构建和对应的 Python 构建支持 glibc 2.17，项目依赖安装限定为兼容 `manylinux_2_17` 的预编译 wheel。Antigravity 使用官方 `linux_amd64_musl` 清单中的静态构建，逐次核对 SHA512，并在安装完成前执行 `agy --version`。该分支需要在目标 CentOS 7 机器上完成 CLI 登录、模型生成和 QQ 收发验收。[uv 平台支持](https://docs.astral.sh/uv/reference/policies/platforms/)、[Python 构建运行要求](https://gregoryszorc.com/docs/python-build-standalone/main/running.html)
+
+### 获取源码并安装运行环境
+
+服务器需要 `git`、`curl`、`tar`、`gzip`、`flock` 和有效的 CA 根证书，以及访问 GitHub、Astral、Google 官方下载和模型服务、QQ 服务的网络连接。
+
+将代码推送到 GitHub 私有仓库后，使用 root 创建服务账号和部署目录。
+
+```bash
+useradd --system --user-group --create-home --home-dir /home/qqbridge --shell /bin/bash qqbridge
+install -d -o qqbridge -g qqbridge -m 755 /opt/qq-antigravity-bridge
+su - qqbridge
+```
+
+在 `qqbridge` 账号下配置仓库的只读部署密钥，然后拉取代码并安装运行环境。把仓库地址替换为实际 SSH 地址。后续更新同样在 `qqbridge` 账号下执行。[GitHub 部署密钥](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys)
+
+```bash
+git clone --branch centos7 '你的私有仓库SSH地址' /opt/qq-antigravity-bridge
+cd /opt/qq-antigravity-bridge
+bash deploy/centos7-install.sh
+```
+
+脚本生成 `.local/server.env`，文件权限为 `0600`。使用 `vi .local/server.env` 填写服务器配置。
+
+```bash
+QQBOT_APP_ID='你的机器人AppID'
+QQBOT_APP_SECRET='你的机器人AppSecret'
+# QQBOT_MODEL='可选的模型ID'
+```
+
+该文件采用 shell 和 systemd 均支持的变量赋值格式，变量值用单引号包围。Linux 的配对账号及群授权保存在 `.local/config.json`，机器人密钥由环境变量提供。
+
+### 登录并测试
+
+继续在 `qqbridge` 账号下运行，按官方 CLI 提示完成登录，然后退出 CLI 回到终端。
+
+```bash
+export PATH="$PWD/.runtime/agy/bin:$PATH"
+export AGY_CLI_DISABLE_AUTO_UPDATE=true
+agy
+```
+
+CLI 使用缓存的登录凭据进行无界面调用。Linux 凭据访问若报告 keyring 或 D-Bus 错误，按官方故障排查配置账号的密钥服务，并让 systemd 服务使用该账号的凭据访问环境。[CLI 无界面运行](https://antigravity.google/docs/cli/headless/)、[CLI 故障排查](https://antigravity.google/docs/cli/troubleshooting)
+
+加载机器人配置，先测试模型生成，再启动 QQ 收发测试。配对及群授权流程见上文。
+
+```bash
+set -a
+. .local/server.env
+set +a
+.venv/bin/python bridge.py check-agy
+.venv/bin/python bridge.py run
+```
+
+测试完成后按 Ctrl+C 停止桥接，再执行 `exit` 返回 root 账号。
+
+### 配置开机启动
+
+使用 root 安装服务并启动。
+
+```bash
+cd /opt/qq-antigravity-bridge
+install -m 644 deploy/qq-antigravity-bridge.service /etc/systemd/system/qq-antigravity-bridge.service
+systemctl daemon-reload
+systemctl enable qq-antigravity-bridge
+systemctl start qq-antigravity-bridge
+journalctl -u qq-antigravity-bridge -n 50 --no-pager
+```
+
+服务通过 `--daemon` 处理 SIGTERM 和 SIGINT，systemd 管理异常重启及进程组退出。查看实时日志使用 `journalctl -u qq-antigravity-bridge -f`，停止服务使用 `systemctl stop qq-antigravity-bridge`。
+
+服务文件设置 `AGY_CLI_DISABLE_AUTO_UPDATE=true`，使 CLI 版本更新继续走安装脚本中的 musl 构建和 SHA512 校验流程。后续更新时，以 root 停止服务，以 `qqbridge` 账号拉取 `centos7` 分支并重新运行安装脚本，完成模型检查后再由 root 启动服务。
