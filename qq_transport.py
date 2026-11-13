@@ -87,6 +87,14 @@ class QQTransport:
         except ImportError:
             raise QQError("缺少QQ连接依赖，请先运行安装脚本") from None
 
+        class UnquotedApiClient(QQApiClient):
+            @staticmethod
+            def build_text_body(*args: Any, **kwargs: Any) -> Any:
+                body = QQApiClient.build_text_body(*args, **kwargs)
+                # Keep the passive-reply ID while omitting the visible quote.
+                body.message_reference = None
+                return body
+
         self._running = True
         active = True
         loop = asyncio.get_running_loop()
@@ -173,7 +181,7 @@ class QQTransport:
         try:
             self._report("正在连接QQ官方机器人")
             async with httpx.AsyncClient() as http:
-                api = QQApiClient(app_id=self._app_id, client_secret=self._app_secret)
+                api = UnquotedApiClient(app_id=self._app_id, client_secret=self._app_secret)
                 api.setup(http)
                 self._api = api
                 ws = QQWebSocket(

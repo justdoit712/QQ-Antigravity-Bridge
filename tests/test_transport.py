@@ -39,6 +39,7 @@ class FakeSDK:
         self.init_error = None
         self.send_error = None
         self.sent = []
+        self.bodies = []
         owner = self
 
         class HTTP:
@@ -78,10 +79,20 @@ class FakeSDK:
             def clear_token(self):
                 pass
 
+            @staticmethod
+            def build_text_body(content, reply_to=None, markdown=True, max_length=4000):
+                return types.SimpleNamespace(
+                    content=content[:max_length],
+                    msg_id=reply_to or "",
+                    msg_seq=1,
+                    message_reference=types.SimpleNamespace(message_id=reply_to) if reply_to else None,
+                )
+
             async def send_text(self, *args, **kwargs):
                 if owner.send_error:
                     raise owner.send_error
                 owner.sent.append((args, kwargs))
+                owner.bodies.append(self.build_text_body(args[2], **kwargs))
 
         class WebSocket:
             def __init__(self, callbacks):
@@ -236,7 +247,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.received, [])
             self.assertEqual(self.sdk.sent, [])
 
-    async def test_send_uses_passive_plain_text_reply(self):
+    async def test_send_uses_passive_plain_text_without_quote(self):
         message = QQMessage("c2c", "owner-openid", "owner-openid", "message-id", "hello")
         async with self.running():
             await self.transport.send(message, "reply")
@@ -244,10 +255,13 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 self.sdk.sent,
                 [(("c2c", "owner-openid", "reply"), {"reply_to": "message-id", "markdown": False})],
             )
+            self.assertEqual(self.sdk.bodies[0].msg_id, "message-id")
+            self.assertEqual(self.sdk.bodies[0].msg_seq, 1)
+            self.assertIsNone(self.sdk.bodies[0].message_reference)
         with self.assertRaisesRegex(QQError, "已经停止"):
             await self.transport.send(message, "reply")
 
-    async def test_group_send_targets_group_and_keeps_passive_plain_text_reply(self):
+    async def test_group_send_targets_group_without_quote(self):
         message = QQMessage("group", "member-openid", "group-openid", "group-message", "hello")
         async with self.running():
             await self.transport.send(message, "group reply")
@@ -255,6 +269,9 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 self.sdk.sent,
                 [(("group", "group-openid", "group reply"), {"reply_to": "group-message", "markdown": False})],
             )
+            self.assertEqual(self.sdk.bodies[0].msg_id, "group-message")
+            self.assertEqual(self.sdk.bodies[0].msg_seq, 1)
+            self.assertIsNone(self.sdk.bodies[0].message_reference)
 
     async def test_rejects_other_scopes_and_silent_truncation(self):
         async with self.running():
