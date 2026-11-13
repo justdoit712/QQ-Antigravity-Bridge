@@ -36,6 +36,17 @@ class ResultTests(unittest.TestCase):
         self.assertNotIn("sensitive-token-secret", str(error.exception))
 
 
+class PromptTests(unittest.TestCase):
+    def test_brief_default_allows_requested_detail_and_preserves_plain_text(self):
+        prompt = AgyBackend(Config()).build_prompt([], "你好")
+        self.assertIn("50～150 字", prompt)
+        self.assertIn("简单问题直接简短回答", prompt)
+        self.assertIn("无需凑字数", prompt)
+        self.assertIn("用户明确要求详细解释时再按需展开", prompt)
+        self.assertIn("纯文本聊天", prompt)
+        self.assertNotIn("800 字", prompt)
+
+
 class ProcessTests(unittest.IsolatedAsyncioTestCase):
     @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
     async def test_cleanup_kills_descendants_after_parent_exit(self):
@@ -125,3 +136,133 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
                 await task
             kill.assert_awaited_once_with(process)
         self.assertIsNone(backend.process)
+
+    async def test_finishing_one_reply_keeps_other_process_tracked(self):
+        backend = AgyBackend(Config())
+        first_process = AsyncMock(returncode=0)
+        second_process = AsyncMock(returncode=0)
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        finish_first = asyncio.Event()
+        finish_second = asyncio.Event()
+
+        async def first_reply(**_):
+            first_started.set()
+            await finish_first.wait()
+            return result("first"), b""
+
+        async def second_reply(**_):
+            second_started.set()
+            await finish_second.wait()
+            return result("second"), b""
+
+        first_process.communicate.side_effect = first_reply
+        second_process.communicate.side_effect = second_reply
+        with patch("agy_backend.resolve_agy", return_value="fake"), \
+                patch("agy_backend.asyncio.create_subprocess_exec",
+                      side_effect=[first_process, second_process]), \
+                patch("agy_backend.kill_process_tree", new_callable=AsyncMock) as kill:
+            first_task = asyncio.create_task(backend.reply([], "first"))
+            await asyncio.wait_for(first_started.wait(), 1)
+            second_task = asyncio.create_task(backend.reply([], "second"))
+            await asyncio.wait_for(second_started.wait(), 1)
+            try:
+                finish_second.set()
+                self.assertEqual(await second_task, "second")
+                self.assertIs(backend.process, first_process)
+                first_task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await first_task
+                kill.assert_awaited_once_with(first_process)
+                self.assertIsNone(backend.process)
+            finally:
+                for task in (first_task, second_task):
+                    task.cancel()
+                await asyncio.gather(first_task, second_task, return_exceptions=True)
+
+    async def test_close_kills_both_concurrent_processes_and_stops_new_replies(self):
+        backend = AgyBackend(Config())
+        processes = [AsyncMock(returncode=0), AsyncMock(returncode=0)]
+        started = [asyncio.Event(), asyncio.Event()]
+        finished = [asyncio.Event(), asyncio.Event()]
+
+        async def communicate(index, **_):
+            started[index].set()
+            await finished[index].wait()
+            return result(), b""
+
+        async def first_reply(**kwargs):
+            return await communicate(0, **kwargs)
+
+        async def second_reply(**kwargs):
+            return await communicate(1, **kwargs)
+
+        async def kill_process(process):
+            index = processes.index(process)
+            process.returncode = 1
+            finished[index].set()
+
+        processes[0].communicate.side_effect = first_reply
+        processes[1].communicate.side_effect = second_reply
+        with patch("agy_backend.resolve_agy", return_value="fake"), \
+                patch("agy_backend.asyncio.create_subprocess_exec", side_effect=processes) as spawn, \
+                patch("agy_backend.kill_process_tree", side_effect=kill_process) as kill:
+            first_task = asyncio.create_task(backend.reply([], "first"))
+            await asyncio.wait_for(started[0].wait(), 1)
+            second_task = asyncio.create_task(backend.reply([], "second"))
+            await asyncio.wait_for(started[1].wait(), 1)
+            try:
+                await backend.close()
+                outcomes = await asyncio.gather(first_task, second_task, return_exceptions=True)
+                self.assertTrue(all(isinstance(outcome, AgyError) for outcome in outcomes))
+                self.assertIsNone(backend.process)
+                killed_processes = {call.args[0] for call in kill.await_args_list}
+                self.assertEqual(killed_processes, set(processes))
+                with self.assertRaises(AgyError):
+                    await backend.reply([], "after close")
+                self.assertEqual(spawn.await_count, 2)
+            finally:
+                for task in (first_task, second_task):
+                    task.cancel()
+                await asyncio.gather(first_task, second_task, return_exceptions=True)
+
+    async def test_close_waits_for_pending_spawn_then_kills_its_process(self):
+        backend = AgyBackend(Config())
+        process = AsyncMock(returncode=0)
+        spawning = asyncio.Event()
+        spawned = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def spawn(*_, **kwargs):
+            spawning.set()
+            await spawned.wait()
+            return process
+
+        async def communicate(**_):
+            await finished.wait()
+            return result(), b""
+
+        async def kill_process(_):
+            process.returncode = 1
+            finished.set()
+
+        process.communicate.side_effect = communicate
+        with patch("agy_backend.resolve_agy", return_value="fake"), \
+                patch("agy_backend.asyncio.create_subprocess_exec", side_effect=spawn), \
+                patch("agy_backend.kill_process_tree", side_effect=kill_process) as kill:
+            reply_task = asyncio.create_task(backend.reply([], "hello"))
+            await asyncio.wait_for(spawning.wait(), 1)
+            close_task = asyncio.create_task(backend.close())
+            try:
+                await asyncio.sleep(0)
+                self.assertFalse(close_task.done())
+                spawned.set()
+                await asyncio.wait_for(close_task, 1)
+                with self.assertRaises(AgyError):
+                    await reply_task
+                kill.assert_any_await(process)
+                self.assertIsNone(backend.process)
+            finally:
+                reply_task.cancel()
+                close_task.cancel()
+                await asyncio.gather(reply_task, close_task, return_exceptions=True)

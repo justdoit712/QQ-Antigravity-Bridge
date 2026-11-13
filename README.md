@@ -39,7 +39,17 @@
 - 支持已授权账号的文字私聊及授权群的 @聊天，各账号、各群最近约 6 轮上下文会从本地归档独立恢复。发送 `/reset` 持久清空当前会话上下文。
 - 暂不处理图片、语音、文件或操作电脑。文字回复超过 1800 字会明确截断。
 - 窗口显示运行状态，已完成的文字对话保存为本地聊天归档。QQ 聊天文本会发送给 Antigravity 使用的模型服务。
-- 请求串行处理，最多等待 8 条；单次生成最多 120 秒。SDK 自动保持心跳、刷新 Token 和重连。
+- 不同群、私聊最多同时处理 2 条请求，同一会话按顺序回复，全局最多等待 8 条。单次生成最多 120 秒。日常聊天默认简短回答，明确要求详细解释时按需展开。SDK 自动保持心跳、刷新 Token 和重连。
+
+### 回复耗时
+
+调用模型的聊天请求结束后，后台输出一条 `timing` JSON 日志，记录接收后等待入队的 `admission_seconds`、排队的 `queue_seconds`、等待授权锁的 `authorization_seconds`、整次 CLI 调用的 `model_seconds`、QQ 发送的 `delivery_seconds` 和总耗时 `total_seconds`，单位均为秒。`model_seconds` 包含 CLI 启动、模型服务等待、生成和退出时间。`outcome` 标记发送、失败或丢弃等结果。
+
+Linux 服务可使用以下命令查看耗时日志。
+
+```bash
+journalctl -u qq-antigravity-bridge -n 100 --no-pager | grep '"event": "timing"'
+```
 
 ## 聊天记录与记忆
 

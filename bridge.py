@@ -15,15 +15,17 @@ import sys
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from agy_backend import AgyBackend, AgyError
 from config_store import CONFIG_PATH, ROOT, Config, ConfigError, load_config, save_config
+from conversation_queue import ConversationQueue
 from history_commands import HistoryCommand, format_history_page, format_history_turn, parse_history_command
 from history_store import ConversationKey, HistoryError, HistoryStore, trim_context
 from qq_transport import QQMessage
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
+CHAT_WORKERS = 2
 
 
 @dataclass(frozen=True)
@@ -32,9 +34,16 @@ class QueuedMessage:
     version: int
     history_command: HistoryCommand | None = None
     target_version: int = 0
+    received_at: float = field(default_factory=time.monotonic)
+    enqueued_at: float = field(default_factory=time.monotonic)
+
+    def conversation_key(self) -> tuple[str, str]:
+        if self.history_command is not None:
+            return self.history_command.scope, self.history_command.chat_id
+        return self.message.scope, self.message.chat_id
 
 
-def emit(event: str, message: str, **extra: str) -> None:
+def emit(event: str, message: str, **extra: object) -> None:
     print(json.dumps({"event": event, "message": message, **extra}, ensure_ascii=False), flush=True)
 
 
@@ -88,7 +97,7 @@ class ChatBridge:
             for group in config.group_ids
         }
         self.group_versions = {group: 0 for group in config.group_ids}
-        self.queue: asyncio.Queue[QueuedMessage] = asyncio.Queue(maxsize=8)
+        self.queue = ConversationQueue(maxsize=8, key=QueuedMessage.conversation_key)
         self.authorization_lock = asyncio.Lock()
         self.seen: OrderedDict[str, None] = OrderedDict()
         self.code = secrets.token_hex(4)
@@ -203,6 +212,7 @@ class ChatBridge:
         return False
 
     async def handle(self, message) -> None:
+        received_at = time.monotonic()
         if (message.scope not in {"c2c", "group"} or not message.user_id or not message.chat_id
                 or not message.message_id
                 or (message.scope == "c2c" and message.chat_id != message.user_id)):
@@ -306,7 +316,7 @@ class ChatBridge:
             versions = self.group_versions if message.scope == "group" else self.private_versions
             try:
                 self.queue.put_nowait(QueuedMessage(message, versions.get(message.chat_id, 0),
-                                                   history_request, target_version))
+                                                   history_request, target_version, received_at=received_at))
             except asyncio.QueueFull:
                 self.emit("status", "待回复消息已满，暂时忽略新的消息，请等当前回答完成。")
 
@@ -334,8 +344,16 @@ class ChatBridge:
         while True:
             item = await self.queue.get()
             message, version = item.message, item.version
+            started_at = time.monotonic()
+            authorization_seconds = 0.0
+            model_seconds = 0.0
+            delivery_seconds = 0.0
+            model_started = None
+            outcome = "discarded"
             try:
+                lock_started = time.monotonic()
                 async with self.authorization_lock:
+                    authorization_seconds += time.monotonic() - lock_started
                     if not self.still_authorized(message, version):
                         continue
                     group = message.scope == "group"
@@ -368,20 +386,38 @@ class ChatBridge:
                 if group:
                     member = hashlib.sha256(message.user_id.encode()).hexdigest()[:8]
                     text = f"[群成员 {member}] {text}"
+                model_started = time.monotonic()
                 try:
-                    answer = await self.backend.reply(history, text, group=True) if group else await self.backend.reply(history, text)
+                    try:
+                        answer = await self.backend.reply(history, text, group=True) if group else await self.backend.reply(history, text)
+                    finally:
+                        model_seconds = time.monotonic() - model_started
                 except AgyError as exc:
+                    outcome = "generation_error"
                     self.emit("error", str(exc))
+                    lock_started = time.monotonic()
                     async with self.authorization_lock:
+                        authorization_seconds += time.monotonic() - lock_started
                         if self.still_authorized(message, version):
-                            await self.transport.send(message, str(exc))
+                            delivery_started = time.monotonic()
+                            try:
+                                await self.transport.send(message, str(exc))
+                            finally:
+                                delivery_seconds = time.monotonic() - delivery_started
                     continue
+                lock_started = time.monotonic()
                 async with self.authorization_lock:
+                    authorization_seconds += time.monotonic() - lock_started
                     if not self.still_authorized(message, version):
                         continue
                     # Delivery and history changes finish before revocation is acknowledged.
                     answer = answer if len(answer) <= 1800 else answer[:1780] + "\n（回复较长，已截断）"
-                    await self.transport.send(message, answer)
+                    delivery_started = time.monotonic()
+                    try:
+                        await self.transport.send(message, answer)
+                    finally:
+                        delivery_seconds = time.monotonic() - delivery_started
+                    outcome = "sent"
                     if not self.archive.append(conversation, message.message_id, text, answer, self.config.model):
                         continue
                     history.extend([{"role": "user", "content": text},
@@ -389,19 +425,36 @@ class ChatBridge:
                     trim_context(history)
                     self.emit("status", "回答已发送。等待下一条消息。")
             except asyncio.CancelledError:
+                outcome = "cancelled"
                 raise
             except HistoryError as exc:
+                outcome = "history_error"
                 self.emit("error", str(exc))
+                lock_started = time.monotonic()
                 async with self.authorization_lock:
+                    authorization_seconds += time.monotonic() - lock_started
                     if self.still_authorized(message, version):
+                        delivery_started = time.monotonic()
                         try:
                             await self.transport.send(message, str(exc))
                         except Exception:
                             self.emit("error", "聊天记录错误提示发送失败，请检查 QQ 连接与网络。")
+                        finally:
+                            delivery_seconds += time.monotonic() - delivery_started
             except Exception:
+                outcome = "failed"
                 self.emit("error", "本次消息处理失败。请检查 QQ 连接、权限与网络后重试。")
             finally:
-                self.queue.task_done()
+                self.queue.task_done(item)
+                if model_started is not None:
+                    self.emit("timing", "聊天请求耗时。", request_id=secrets.token_hex(4),
+                        model=self.config.model, outcome=outcome,
+                        admission_seconds=round(item.enqueued_at - item.received_at, 3),
+                        queue_seconds=round(started_at - item.enqueued_at, 3),
+                        authorization_seconds=round(authorization_seconds, 3),
+                        model_seconds=round(model_seconds, 3),
+                        delivery_seconds=round(delivery_seconds, 3),
+                        total_seconds=round(time.monotonic() - item.received_at, 3))
 
 
 def watch_stdin(stop: asyncio.Event, loop: asyncio.AbstractEventLoop) -> None:
@@ -438,7 +491,7 @@ async def run_bridge(config: Config, *, daemon: bool = False) -> None:
                                 lambda text: emit("status", text))
         bridge.transport = transport
         bridge.announce_pairing()
-        worker = asyncio.create_task(bridge.consume())
+        workers = [asyncio.create_task(bridge.consume()) for _ in range(CHAT_WORKERS)]
         connection = asyncio.create_task(transport.run(stop))
         stopping = asyncio.create_task(stop.wait())
         try:
@@ -447,9 +500,10 @@ async def run_bridge(config: Config, *, daemon: bool = False) -> None:
                 await connection
         finally:
             stop.set()
-            worker.cancel()
+            for worker in workers:
+                worker.cancel()
             stopping.cancel()
-            await asyncio.gather(worker, stopping, return_exceptions=True)
+            await asyncio.gather(*workers, stopping, return_exceptions=True)
             await backend.close()
             try:
                 await asyncio.wait_for(asyncio.shield(connection), 10)
