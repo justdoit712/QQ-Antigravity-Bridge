@@ -23,7 +23,7 @@ from history_commands import HistoryCommand, format_history_page, format_history
 from history_store import ConversationKey, HistoryError, HistoryStore, trim_context
 from qq_transport import QQMessage
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 
 @dataclass(frozen=True)
@@ -318,7 +318,9 @@ class ChatBridge:
                 return
         conversation = self.conversation(command.scope, command.chat_id)
         if command.operation == "clear":
-            self.archive.clear(conversation)
+            source = self.conversation(item.message.scope, item.message.chat_id)
+            if not self.archive.clear(conversation, source=source, message_id=item.message.message_id):
+                return
             self.context_for(command.scope, command.chat_id).clear()
             response = "已删除当前会话的聊天归档和上下文。"
         elif command.operation == "show":
@@ -338,15 +340,17 @@ class ChatBridge:
                         continue
                     group = message.scope == "group"
                     history = self.context_for(message.scope, message.chat_id)
-                    if item.history_command is not None:
-                        await self.handle_history(item)
-                        continue
                     conversation = self.conversation(message.scope, message.chat_id)
                     if self.archive.contains(conversation, message.message_id):
                         continue
+                    if item.history_command is not None:
+                        await self.handle_history(item)
+                        continue
                     text = message.text.strip()
                     if text == "/reset":
-                        self.archive.reset_context(conversation)
+                        if not self.archive.reset_context(conversation, source=conversation,
+                                                          message_id=message.message_id):
+                            continue
                         history.clear()
                         await self.transport.send(message, "已清空本群聊天记忆。" if group else "已清空私聊记忆。")
                         continue

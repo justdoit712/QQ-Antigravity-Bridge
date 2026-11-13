@@ -142,6 +142,47 @@ class PersistentChatTests(unittest.IsolatedAsyncioTestCase):
         backend.reply.assert_not_awaited()
         restarted.transport.send.assert_not_awaited()
 
+    async def test_replayed_clear_after_restart_preserves_newer_private_turns(self):
+        service, _ = self.build()
+        command = private("/history clear", "clear-once", "friend-a")
+        await self.chat(service, private("清理前的内容", "before-clear", "friend-a"))
+        await self.chat(service, command)
+        await self.chat(service, private("清理后的新内容", "after-clear", "friend-a"))
+        restarted, backend = self.build()
+        await self.chat(restarted, command)
+        self.assertEqual(self.count(restarted, "c2c", "friend-a"), 1)
+        self.assertEqual(restarted.private_histories["friend-a"][0]["content"], "清理后的新内容")
+        backend.reply.assert_not_awaited()
+        restarted.transport.send.assert_not_awaited()
+
+    async def test_replayed_reset_after_restart_preserves_newer_context(self):
+        service, _ = self.build()
+        command = private("/reset", "reset-once", "friend-a")
+        await self.chat(service, private("重置前的内容", "before-reset-replay", "friend-a"))
+        await self.chat(service, command)
+        await self.chat(service, private("重置后的新内容", "after-reset-replay", "friend-a"))
+        restarted, backend = self.build()
+        await self.chat(restarted, command)
+        self.assertEqual(self.count(restarted, "c2c", "friend-a"), 2)
+        self.assertEqual(len(restarted.private_histories["friend-a"]), 2)
+        self.assertEqual(restarted.private_histories["friend-a"][0]["content"], "重置后的新内容")
+        backend.reply.assert_not_awaited()
+        restarted.transport.send.assert_not_awaited()
+
+    async def test_replayed_group_clear_cannot_follow_changed_group_numbers(self):
+        service, _ = self.build()
+        command = private("/history group 1 clear", "clear-original-group")
+        await self.chat(service, group("原群甲内容", "group-a-before"))
+        await self.chat(service, group("群乙保留内容", "group-b-before", "group-b"))
+        await self.chat(service, command)
+        await service.handle(private("/ungroup 1", "remove-first-group"))
+        restarted, backend = self.build(service.config)
+        await self.chat(restarted, command)
+        self.assertEqual(self.count(restarted, "group", "group-b"), 1)
+        self.assertIn("群乙保留内容", str(restarted.group_histories["group-b"]))
+        backend.reply.assert_not_awaited()
+        restarted.transport.send.assert_not_awaited()
+
     async def test_group_deletion_requires_administrator_private_command(self):
         service, backend = self.build()
         await self.chat(service, group("群甲的记录", "group-a"))

@@ -95,6 +95,14 @@ class HistoryStore:
                     message_id TEXT NOT NULL,
                     PRIMARY KEY (app_id, owner_id, scope, chat_id, message_id)
                 );
+                CREATE TABLE IF NOT EXISTS control_receipts (
+                    app_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    PRIMARY KEY (app_id, owner_id, scope, chat_id, message_id)
+                );
                 PRAGMA user_version = 1;
             """)
         except (sqlite3.Error, OSError, HistoryError) as error:
@@ -124,44 +132,49 @@ class HistoryStore:
             self._connection.close()
             self._connection = None
 
+    @staticmethod
+    def _contains(database: sqlite3.Connection, conversation: ConversationKey, message_id: str) -> bool:
+        for table in ("control_receipts", "processed_messages", "turns"):
+            found = database.execute(
+                f"SELECT 1 FROM {table} WHERE {CONVERSATION_FILTER} AND message_id = ? LIMIT 1",
+                (*conversation.values, message_id),
+            ).fetchone()
+            if found is not None:
+                return True
+        return False
+
     def contains(self, conversation: ConversationKey, message_id: str) -> bool:
         with self._access() as database:
-            for table in ("processed_messages", "turns"):
-                found = database.execute(
-                    f"SELECT 1 FROM {table} WHERE {CONVERSATION_FILTER} AND message_id = ? LIMIT 1",
-                    (*conversation.values, message_id),
-                ).fetchone()
-                if found is not None:
-                    return True
-        return False
+            return self._contains(database, conversation, message_id)
+
+    @staticmethod
+    def _mark_processed(database: sqlite3.Connection, conversation: ConversationKey, message_id: str) -> None:
+        database.execute(
+            "INSERT OR IGNORE INTO processed_messages VALUES (?, ?, ?, ?, ?)",
+            (*conversation.values, message_id),
+        )
+        # Keep bounded replay protection after archive deletion.
+        database.execute("""
+            DELETE FROM processed_messages WHERE rowid NOT IN (
+                SELECT rowid FROM processed_messages ORDER BY rowid DESC LIMIT 1000
+            )
+        """)
 
     def append(self, conversation: ConversationKey, message_id: str,
                user_text: str, assistant_text: str, model: str) -> bool:
         with self._access() as database:
-            result = database.execute(
-                f"""INSERT OR IGNORE INTO turns
+            database.execute("BEGIN IMMEDIATE")
+            if self._contains(database, conversation, message_id):
+                return False
+            database.execute(
+                """INSERT INTO turns
                     (app_id, owner_id, scope, chat_id, message_id,
                      created_at, user_text, assistant_text, model)
-                    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM processed_messages
-                        WHERE {CONVERSATION_FILTER} AND message_id = ?
-                    )""",
-                (*conversation.values, message_id, time.time(), user_text, assistant_text, model,
-                 *conversation.values, message_id),
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (*conversation.values, message_id, time.time(), user_text, assistant_text, model),
             )
-            inserted = result.rowcount == 1
-            database.execute(
-                "INSERT OR IGNORE INTO processed_messages VALUES (?, ?, ?, ?, ?)",
-                (*conversation.values, message_id),
-            )
-            # Keep bounded replay protection after archive deletion.
-            database.execute("""
-                DELETE FROM processed_messages WHERE rowid NOT IN (
-                    SELECT rowid FROM processed_messages ORDER BY rowid DESC LIMIT 1000
-                )
-            """)
-        return inserted
+            self._mark_processed(database, conversation, message_id)
+        return True
 
     def load_context(self, conversation: ConversationKey) -> list[dict[str, str]]:
         with self._access() as database:
@@ -195,14 +208,31 @@ class HistoryStore:
             (*conversation.values, boundary),
         )
 
-    def reset_context(self, conversation: ConversationKey) -> None:
-        with self._access() as database:
-            self._reset(database, conversation)
+    def reset_context(self, conversation: ConversationKey, *, source: ConversationKey | None = None,
+                      message_id: str = "") -> bool:
+        return self._change_context(conversation, False, source, message_id)
 
-    def clear(self, conversation: ConversationKey) -> None:
+    def clear(self, conversation: ConversationKey, *, source: ConversationKey | None = None,
+              message_id: str = "") -> bool:
+        return self._change_context(conversation, True, source, message_id)
+
+    def _change_context(self, conversation: ConversationKey, delete_archive: bool,
+                        source: ConversationKey | None, message_id: str) -> bool:
+        command_source = source if source is not None else conversation
         with self._access() as database:
+            database.execute("BEGIN IMMEDIATE")
+            if message_id and self._contains(database, command_source, message_id):
+                return False
             self._reset(database, conversation)
-            database.execute(f"DELETE FROM turns WHERE {CONVERSATION_FILTER}", conversation.values)
+            if delete_archive:
+                database.execute(f"DELETE FROM turns WHERE {CONVERSATION_FILTER}", conversation.values)
+            if message_id:
+                # Destructive commands remain idempotent after normal replay IDs expire.
+                database.execute(
+                    "INSERT INTO control_receipts VALUES (?, ?, ?, ?, ?)",
+                    (*command_source.values, message_id),
+                )
+        return True
 
     def page(self, conversation: ConversationKey, page: int = 1,
              keyword: str = "") -> tuple[list[SavedTurn], int]:

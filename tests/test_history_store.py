@@ -105,7 +105,7 @@ class HistoryStoreTests(unittest.TestCase):
         self.append_turn(0)
         old_turn = self.store.page(self.conversation)[0][0]
 
-        self.store.reset_context(self.conversation)
+        self.assertTrue(self.store.reset_context(self.conversation))
         self.reopen()
 
         self.assertEqual(self.store.load_context(self.conversation), [])
@@ -129,12 +129,25 @@ class HistoryStoreTests(unittest.TestCase):
 
         self.assertEqual(self.store.load_context(self.conversation), self.expected_context([0]))
 
+    def test_reset_command_replay_preserves_context_added_after_reset(self):
+        self.append_turn(0)
+        self.assertTrue(self.store.reset_context(self.conversation, message_id="reset-command"))
+        self.assertTrue(self.store.contains(self.conversation, "reset-command"))
+        self.append_turn(1)
+        self.reopen()
+
+        self.assertFalse(self.store.reset_context(self.conversation, message_id="reset-command"))
+        self.assertEqual(self.store.load_context(self.conversation), self.expected_context([1]))
+        self.assertEqual(self.store.page(self.conversation)[1], 2)
+        self.reopen()
+        self.assertEqual(self.store.load_context(self.conversation), self.expected_context([1]))
+
     def test_clear_deletes_archive_and_context_while_preventing_replay(self):
         self.append_turn(0)
         self.append_turn(1)
         old_ids = [turn.id for turn in self.store.page(self.conversation)[0]]
 
-        self.store.clear(self.conversation)
+        self.assertTrue(self.store.clear(self.conversation))
         self.reopen()
 
         self.assertEqual(self.store.page(self.conversation), ([], 0))
@@ -151,6 +164,95 @@ class HistoryStoreTests(unittest.TestCase):
 
         self.assertEqual(self.store.load_context(self.conversation), self.expected_context([2]))
         self.assertEqual(self.store.page(self.conversation)[1], 1)
+
+    def test_clear_command_replay_preserves_archive_added_after_clear(self):
+        self.append_turn(0)
+        self.assertTrue(self.store.clear(self.conversation, message_id="clear-command"))
+        self.assertTrue(self.store.contains(self.conversation, "clear-command"))
+        self.append_turn(1)
+        self.reopen()
+
+        self.assertFalse(self.store.clear(self.conversation, message_id="clear-command"))
+        self.assertEqual(self.store.load_context(self.conversation), self.expected_context([1]))
+        self.assertEqual(self.store.page(self.conversation)[1], 1)
+        self.reopen()
+        self.assertEqual(self.store.load_context(self.conversation), self.expected_context([1]))
+        self.assertTrue(self.store.contains(self.conversation, "clear-command"))
+
+    def test_group_clear_records_command_in_administrator_source_conversation(self):
+        source = replace(self.conversation, chat_id="owner")
+        target = replace(self.conversation, scope="group", chat_id="group-a")
+        other_target = replace(target, chat_id="group-b")
+        self.append_turn(0, source)
+        self.append_turn(1, target)
+        self.append_turn(2, other_target)
+
+        self.assertTrue(self.store.clear(target, source=source, message_id="admin-clear"))
+        self.reopen()
+
+        self.assertTrue(self.store.contains(source, "admin-clear"))
+        self.assertFalse(self.store.contains(target, "admin-clear"))
+        self.assertEqual(self.store.page(target), ([], 0))
+        self.assertEqual(self.store.load_context(source), self.expected_context([0]))
+        self.assertFalse(self.store.clear(other_target, source=source, message_id="admin-clear"))
+        self.assertEqual(self.store.load_context(other_target), self.expected_context([2]))
+        self.assertEqual(self.store.page(other_target)[1], 1)
+
+    def test_control_receipts_survive_normal_replay_marker_eviction(self):
+        for action_name in ("reset_context", "clear"):
+            with self.subTest(action=action_name):
+                target = replace(self.conversation, chat_id=action_name)
+                self.append_turn(0, target)
+                action = getattr(self.store, action_name)
+                self.assertTrue(action(target, message_id="old-control-command"))
+                for index in range(1001):
+                    self.store.append(target, f"new-message-{index}", f"新问题 {index}", "新回答", "model")
+                self.reopen()
+                expected_context = self.store.load_context(target)
+                expected_archive = self.store.page(target)
+
+                self.assertTrue(self.store.contains(target, "old-control-command"))
+                self.assertFalse(self.store.append(
+                    target, "old-control-command", "重复内容", "重复回答", "model"))
+                action = getattr(self.store, action_name)
+                self.assertFalse(action(target, message_id="old-control-command"))
+                self.assertEqual(self.store.load_context(target), expected_context)
+                self.assertEqual(self.store.page(target), expected_archive)
+
+    def test_failed_control_marker_rolls_back_reset_and_clear(self):
+        source = replace(self.conversation, chat_id="owner")
+        for action_name in ("reset_context", "clear"):
+            with self.subTest(action=action_name):
+                target = replace(self.conversation, scope="group", chat_id=action_name)
+                self.append_turn(0, target)
+                original_turns = self.store.page(target)
+                with closing(sqlite3.connect(self.path)) as database:
+                    database.execute("""
+                        CREATE TRIGGER reject_control_marker
+                        BEFORE INSERT ON control_receipts
+                        BEGIN
+                            SELECT RAISE(ABORT, 'synthetic-control-marker-error');
+                        END;
+                    """)
+                    database.commit()
+
+                action = getattr(self.store, action_name)
+                with self.assertRaises(HistoryError) as error:
+                    action(target, source=source, message_id=action_name)
+
+                self.assertNotIn("synthetic-control-marker-error", str(error.exception))
+                self.reopen()
+                self.assertEqual(self.store.page(target), original_turns)
+                self.assertEqual(self.store.load_context(target), self.expected_context([0]))
+                self.assertFalse(self.store.contains(source, action_name))
+                with closing(sqlite3.connect(self.path)) as database:
+                    database.execute("DROP TRIGGER reject_control_marker")
+                    database.commit()
+                action = getattr(self.store, action_name)
+                self.assertTrue(action(target, source=source, message_id=action_name))
+                self.assertTrue(self.store.contains(source, action_name))
+                self.assertEqual(self.store.load_context(target), [])
+                self.assertEqual(self.store.page(target)[1], 0 if action_name == "clear" else 1)
 
     def test_reset_and_clear_leave_other_conversations_untouched(self):
         other = replace(self.conversation, chat_id="other-friend")
