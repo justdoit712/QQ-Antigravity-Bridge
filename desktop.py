@@ -39,6 +39,7 @@ class BridgeWindow(tk.Tk):
         self._active_secret = ""
         self._owner_id = ""
         self._group_count = 0
+        self._private_user_count = 0
         self._checked = False
         self._process_error = False
         self._unrecognized_output = False
@@ -61,6 +62,7 @@ class BridgeWindow(tk.Tk):
         self.pair_hint = tk.StringVar(value="尚未配对时，启动桥接后会在这里显示配对码。")
         self._owner_id = config.owner_id
         self._group_count = len(config.group_ids)
+        self._private_user_count = len(config.private_user_ids)
 
         self._configure_style()
         self._build(config.persona)
@@ -108,7 +110,7 @@ class BridgeWindow(tk.Tk):
         instructions = ttk.Label(
             body,
             text=(
-                "首次启动后，在 QQ 私聊 doro 发送配对码；私聊仅配对账号可用。保持本窗口运行。\n"
+                "首次启动后，私聊发送配对码成为管理员；私聊 /invite 可邀请其他 QQ 使用。保持本窗口运行。\n"
                 "群聊：私聊发送 /group 获取绑定码，再在目标群 @doro /bind 绑定码；绑定后 @doro 提问。"
             ),
             wraplength=760,
@@ -252,17 +254,19 @@ class BridgeWindow(tk.Tk):
         self.log.configure(state="disabled")
 
     def _show_owner(self) -> None:
-        owner = "已配对一个 QQ 账号" if self._owner_id else "尚未配对 QQ 账号"
-        self.owner_status.set(f"{owner} · 已绑定 {self._group_count} 个群")
+        owner = "管理员已配对" if self._owner_id else "尚未配对 QQ 账号"
+        private_count = self._private_user_count + bool(self._owner_id)
+        self.owner_status.set(f"{owner} · 私聊账号 {private_count} 个 · 已绑定 {self._group_count} 个群")
         if self._owner_id:
             self.pair_code.set("")
-            self.pair_hint.set("已完成配对，私聊仅配对账号可用。需要换账号时，请先停止桥接再解除配对。")
+            self.pair_hint.set("管理员已配对，私聊 /invite 可邀请其他 QQ。更换管理员前请停止桥接并解除配对。")
 
     def _refresh_owner(self) -> None:
         try:
             config = load_config()
             self._owner_id = config.owner_id
             self._group_count = len(config.group_ids)
+            self._private_user_count = len(config.private_user_ids)
         except Exception:
             return
         self._show_owner()
@@ -284,10 +288,12 @@ class BridgeWindow(tk.Tk):
                 persona=self.persona.get("1.0", "end-1c").strip(),
                 owner_id=owner_id,
                 group_ids=list(latest.group_ids) if app_id == latest.app_id else [],
+                private_user_ids=list(latest.private_user_ids) if app_id == latest.app_id else [],
             )
             save_config(config)
             self._owner_id = owner_id
             self._group_count = len(config.group_ids)
+            self._private_user_count = len(config.private_user_ids)
             if app_id != latest.app_id:
                 self.pair_code.set("")
                 self.pair_hint.set("机器人已更换，启动后请使用新的配对码重新配对。")
@@ -308,17 +314,18 @@ class BridgeWindow(tk.Tk):
             return
         try:
             config = load_config()
-            save_config(replace(config, owner_id="", group_ids=[]))
+            save_config(replace(config, owner_id="", group_ids=[], private_user_ids=[]))
         except Exception:
             messagebox.showerror("无法解除配对", "配置保存失败，配对状态未更改。", parent=self)
             return
         self._owner_id = ""
         self._group_count = 0
+        self._private_user_count = 0
         self.pair_code.set("")
         self.pair_hint.set("配对已解除；下次启动后，请在 QQ 私聊 doro 发送新的配对码。")
         self._show_owner()
         self.status.set("已解除配对")
-        self._append_log("配对及群绑定已解除。下次启动时将生成新的配对码。")
+        self._append_log("配对、私聊授权及群绑定已解除。下次启动时将生成新的配对码。")
         self._set_controls()
 
     def _copy_pair_code(self) -> None:

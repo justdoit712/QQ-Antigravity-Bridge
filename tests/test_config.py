@@ -22,7 +22,8 @@ class ConfigTests(unittest.TestCase):
     def test_dpapi_round_trip_and_no_plaintext_secret_on_disk(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
-            config = Config("123456", "test-secret-不是实际密钥", "model", "中文角色", "user-openid", ["group-openid"])
+            config = Config("123456", "test-secret-不是实际密钥", "model", "中文角色", "user-openid", ["group-openid"],
+                            ["friend-openid"])
             with patch.object(config_store, "CONFIG_PATH", path):
                 save_config(config)
                 self.assertNotIn(config.app_secret, path.read_text(encoding="utf-8"))
@@ -43,7 +44,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertFalse(path.exists())
 
     def test_linux_persists_state_without_secret(self):
-        config = Config("123456", "environment-secret", "model", "中文角色", "owner", ["group"])
+        config = Config("123456", "environment-secret", "model", "中文角色", "owner", ["group"], ["friend"])
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".local" / "config.json"
             with patch.object(config_store, "CONFIG_PATH", path), \
@@ -86,17 +87,44 @@ class ConfigTests(unittest.TestCase):
     def test_environment_bot_change_clears_previous_authorization(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
-            path.write_text(json.dumps({"app_id": "123456", "owner_id": "owner", "group_ids": ["group"]}),
+            path.write_text(json.dumps({"app_id": "123456", "owner_id": "owner", "group_ids": ["group"],
+                                        "private_user_ids": ["friend"]}),
                             encoding="utf-8")
             with patch.object(config_store, "CONFIG_PATH", path):
                 with patch.dict(os.environ, {"QQBOT_APP_ID": "123456"}):
                     self.assertEqual(load_config().owner_id, "owner")
                     self.assertEqual(load_config().group_ids, ["group"])
+                    self.assertEqual(load_config().private_user_ids, ["friend"])
                 with patch.dict(os.environ, {"QQBOT_APP_ID": "654321"}):
                     config = load_config()
                     self.assertEqual(config.app_id, "654321")
                     self.assertEqual(config.owner_id, "")
                     self.assertEqual(config.group_ids, [])
+                    self.assertEqual(config.private_user_ids, [])
+
+    def test_previous_config_preserves_owner_and_groups_with_no_extra_private_users(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            previous = {"version": 2, "app_id": "123456", "owner_id": "owner", "group_ids": ["group"]}
+            path.write_text(json.dumps(previous), encoding="utf-8")
+            with patch.object(config_store, "CONFIG_PATH", path):
+                config = load_config()
+                self.assertEqual(config.owner_id, "owner")
+                self.assertEqual(config.group_ids, ["group"])
+                self.assertEqual(config.private_user_ids, [])
+
+    def test_private_users_are_deduplicated_and_invalid_ids_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            for users in (["friend", "friend"], "friend", [""], [123], None):
+                with self.subTest(users=users), patch.object(config_store, "CONFIG_PATH", path):
+                    path.write_text(json.dumps({"app_id": "123456", "private_user_ids": users}),
+                                    encoding="utf-8")
+                    if users == ["friend", "friend"]:
+                        self.assertEqual(load_config().private_user_ids, ["friend"])
+                    else:
+                        with self.assertRaises(config_store.ConfigError):
+                            load_config()
 
     def test_failed_atomic_save_preserves_existing_state_and_cleans_temp_file(self):
         with tempfile.TemporaryDirectory() as directory:

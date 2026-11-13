@@ -22,6 +22,7 @@ class PairingTests(unittest.IsolatedAsyncioTestCase):
         backend = Mock(reply=AsyncMock(return_value="你好呀"))
         service = ChatBridge(Config("123", "secret", owner_id=owner), backend,
                              emit_event=Mock(), persist=persisted)
+        self.addCleanup(service.archive.close)
         service.transport = Mock(send=AsyncMock())
         return service, persisted, backend
 
@@ -129,6 +130,8 @@ class ShutdownTests(unittest.IsolatedAsyncioTestCase):
     async def test_daemon_entrypoint_survives_eof_and_stops_on_sigterm(self):
         script = '''
 import sys
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 from bridge import main
 from config_store import Config
@@ -142,9 +145,11 @@ class FakeTransport:
         await stop.wait()
 
 sys.argv = ["bridge.py", "run", "--daemon"]
-with patch("bridge.load_config", return_value=Config("123", "test-secret", owner_id="owner")), \\
-        patch("bridge.RunLock"), patch("qq_transport.QQTransport", FakeTransport):
-    raise SystemExit(main())
+with tempfile.TemporaryDirectory() as directory:
+    with patch("bridge.load_config", return_value=Config("123", "test-secret", owner_id="owner")), \\
+            patch("bridge.ROOT", Path(directory)), patch("bridge.RunLock"), \\
+            patch("qq_transport.QQTransport", FakeTransport):
+        raise SystemExit(main())
 '''
         process = await asyncio.create_subprocess_exec(
             sys.executable, "-c", script, stdin=asyncio.subprocess.DEVNULL,

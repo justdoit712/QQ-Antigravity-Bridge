@@ -22,6 +22,7 @@ class GroupTests(unittest.IsolatedAsyncioTestCase):
         persist = Mock()
         service = ChatBridge(Config("123", "key", owner_id="owner", group_ids=list(groups)),
                              backend, persist=persist, emit_event=Mock())
+        self.addCleanup(service.archive.close)
         service.transport = Mock(send=AsyncMock())
         return service, backend, persist
 

@@ -32,6 +32,7 @@ class Config:
     persona: str = DEFAULT_PERSONA
     owner_id: str = ""
     group_ids: list[str] = field(default_factory=list)
+    private_user_ids: list[str] = field(default_factory=list)
 
     def validate_qq(self) -> None:
         if not self.app_id.strip().isascii() or not self.app_id.strip().isdigit():
@@ -94,6 +95,11 @@ def load_config() -> Config:
         groups = data.get("group_ids", [])
         if not isinstance(groups, list) or any(not isinstance(group, str) or not group for group in groups):
             raise ValueError()
+        private_users = data.get("private_user_ids", [])
+        if not isinstance(private_users, list) or any(
+            not isinstance(user, str) or not user for user in private_users
+        ):
+            raise ValueError()
         saved_app_id = str(data.get("app_id", ""))
         app_id = os.environ.get("QQBOT_APP_ID", saved_app_id)
         changed_bot = app_id.strip() != saved_app_id.strip()
@@ -104,6 +110,7 @@ def load_config() -> Config:
             persona=os.environ.get("QQBOT_PERSONA", str(data.get("persona", DEFAULT_PERSONA))),
             owner_id="" if changed_bot else str(data.get("owner_id", "")),
             group_ids=[] if changed_bot else list(dict.fromkeys(groups)),
+            private_user_ids=[] if changed_bot else list(dict.fromkeys(private_users)),
         )
     except (ValueError, TypeError, UnicodeError, KeyError) as exc:
         raise ConfigError("本地配置格式无效，请重新填写并保存配置。") from exc
@@ -111,12 +118,13 @@ def load_config() -> Config:
 
 def save_config(config: Config) -> None:
     data = {
-        "version": 2,
+        "version": 3,
         "app_id": config.app_id.strip(),
         "model": config.model.strip(),
         "persona": config.persona,
         "owner_id": config.owner_id,
         "group_ids": list(dict.fromkeys(config.group_ids)),
+        "private_user_ids": list(dict.fromkeys(config.private_user_ids)),
     }
     if IS_WINDOWS:
         data["app_secret_dpapi"] = base64.b64encode(_crypt(config.app_secret.encode("utf-8"))).decode("ascii") \
